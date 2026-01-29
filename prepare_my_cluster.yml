@@ -1,0 +1,127 @@
+- name: Prepare Mixed-Arch Cluster
+  hosts: master
+  become: yes
+  tasks:
+    - name: Disable Swap (Required for K3s)
+      shell: |
+        swapoff -a
+        sed -i '/swap/s/^/#/' /etc/fstab
+
+    - name: Update Apt Cache
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Check if cmdline.txt exists (Raspberry Pi current)
+      stat:
+        path: /boot/firmware/current/cmdline.txt
+      register: cmdline_current
+
+    - name: Check if cmdline.txt exists (Raspberry Pi / Ubuntu)
+      stat:
+        path: /boot/firmware/cmdline.txt
+      register: cmdline_firmware
+
+    - name: Check if cmdline.txt exists (Generic)
+      stat:
+        path: /boot/cmdline.txt
+      register: cmdline_boot
+
+    - name: Select cmdline.txt path
+      set_fact:
+        cmdline_path: >-
+          {{ '/boot/firmware/current/cmdline.txt' if cmdline_current.stat.exists else
+             ('/boot/firmware/cmdline.txt' if cmdline_firmware.stat.exists else
+             ('/boot/cmdline.txt' if cmdline_boot.stat.exists else '')) }}
+
+    - name: Check if cgroup config already applied
+      shell: grep -q "cgroup_memory=1" {{ cmdline_path }}
+      register: cgroup_check
+      ignore_errors: yes
+      changed_when: false
+      when: cmdline_path != ''
+
+    - name: Remove cgroup_disable=memory if present
+      when: cmdline_path != ''
+      replace:
+        path: "{{ cmdline_path }}"
+        regexp: '\\s*cgroup_disable=memory\\b'
+        replace: ""
+      register: cgroup_disable_removed
+
+    - name: Normalize cmdline spacing
+      when: cmdline_path != ''
+      replace:
+        path: "{{ cmdline_path }}"
+        regexp: '\\s{2,}'
+        replace: " "
+      register: cmdline_spacing_normalized
+
+    - name: Enable cgroups in cmdline.txt
+      when: cmdline_path != '' and (cgroup_check.rc | default(0)) != 0
+      lineinfile:
+        path: "{{ cmdline_path }}"
+        backrefs: yes
+        regexp: "^(.*)$"
+        line: '\1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory'
+      register: cgroup_updated
+
+    - name: Reboot if cgroup config was changed
+      reboot:
+        reboot_timeout: 300
+      when: (cgroup_updated.changed | default(false)) or
+        (cgroup_disable_removed.changed | default(false)) or
+        (cmdline_spacing_normalized.changed | default(false))
+
+- name: Install K3s on First Master (Init Cluster with etcd)
+  hosts: master[0]
+  become: yes
+  tasks:
+    - name: Install K3s with etcd on first master
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --cluster-init \
+          --tls-san {{ ansible_host }}
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+
+    - name: Wait for K3s to be ready
+      shell: k3s kubectl get nodes
+      register: k3s_ready
+      retries: 30
+      delay: 10
+      until: k3s_ready.rc == 0
+
+    - name: Get K3s token
+      shell: cat /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+
+    - name: Store token as fact
+      set_fact:
+        k3s_cluster_token: "{{ k3s_token.stdout }}"
+
+- name: Join Additional Masters to K3s Cluster with etcd
+  hosts: master[1:]
+  become: yes
+  serial: 1
+  tasks:
+    - name: Get token from first master
+      set_fact:
+        k3s_cluster_token: "{{ hostvars[groups['master'][0]]['k3s_cluster_token'] }}"
+        k3s_first_master: "{{ groups['master'][0] }}"
+
+    - name: Join K3s cluster as server with etcd
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --server https://{{ k3s_first_master }}:6443 \
+          --token {{ k3s_cluster_token }} \
+          --tls-san {{ ansible_host }}
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+
+    - name: Wait for node to join
+      shell: k3s kubectl get nodes
+      register: node_joined
+      retries: 5
+      delay: 10
+      until: node_joined.rc == 0
