@@ -92,6 +92,41 @@
       delay: 10
       until: k3s_ready.rc == 0
 
+    - name: Create .kube directory for user
+      shell: mkdir -p /home/{{ ansible_user }}/.kube
+      become_user: "{{ ansible_user }}"
+      become: yes
+
+    - name: Generate kubeconfig for non-root user
+      shell: sudo k3s kubectl config view --raw > /home/{{ ansible_user }}/.kube/config
+      become_user: "{{ ansible_user }}"
+      become: yes
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+    - name: Set kubeconfig permissions
+      file:
+        path: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+
+    - name: Add KUBECONFIG export to bashrc
+      lineinfile:
+        path: /home/{{ ansible_user }}/.bashrc
+        line: "export KUBECONFIG=~/.kube/config"
+        create: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Add KUBECONFIG export to profile
+      lineinfile:
+        path: /home/{{ ansible_user }}/.profile
+        line: "export KUBECONFIG=~/.kube/config"
+        create: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
     - name: Get K3s token
       shell: cat /var/lib/rancher/k3s/server/node-token
       register: k3s_token
