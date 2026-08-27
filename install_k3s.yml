@@ -1,0 +1,86 @@
+---
+# Install k3s on the Proxmox VMs listed in inventories/proxmox/hosts.ini.
+# Ubuntu cloud images have no swap and no cmdline.txt, so none of the Raspberry Pi
+# preparation from prepare_my_cluster.yml applies here.
+- name: Prepare nodes
+  hosts: k3s
+  become: true
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [curl, open-iscsi, nfs-common]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+- name: Bootstrap first k3s server
+  hosts: server[0]
+  become: true
+  tasks:
+    - name: Install k3s server
+      ansible.builtin.shell:
+        cmd: "curl -sfL https://get.k3s.io | sh -s - server {{ k3s_args }}"
+        creates: /etc/rancher/k3s/k3s.yaml
+      vars:
+        k3s_args: >-
+          {{ '--cluster-init' if groups['server'] | length > 1 else '' }}
+          --tls-san {{ ansible_host }}
+          --write-kubeconfig-mode 0644
+
+    - name: Wait for node to become Ready
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=300s
+      changed_when: false
+
+    - name: Read cluster token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_file
+
+    - name: Store cluster token
+      ansible.builtin.set_fact:
+        k3s_token: "{{ k3s_token_file.content | b64decode | trim }}"
+
+- name: Join remaining servers
+  hosts: server[1:]
+  become: true
+  serial: 1
+  tasks:
+    - name: Install k3s server
+      ansible.builtin.shell:
+        cmd: >-
+          curl -sfL https://get.k3s.io | sh -s - server
+          --server https://{{ hostvars[groups['server'][0]].ansible_host }}:6443
+          --tls-san {{ ansible_host }}
+        creates: /etc/rancher/k3s/k3s.yaml
+      environment:
+        K3S_TOKEN: "{{ hostvars[groups['server'][0]].k3s_token }}"
+
+- name: Join agents
+  hosts: agent
+  become: true
+  tasks:
+    - name: Install k3s agent
+      ansible.builtin.shell:
+        cmd: curl -sfL https://get.k3s.io | sh -
+        creates: /etc/systemd/system/k3s-agent.service
+      environment:
+        K3S_URL: "https://{{ hostvars[groups['server'][0]].ansible_host }}:6443"
+        K3S_TOKEN: "{{ hostvars[groups['server'][0]].k3s_token }}"
+
+- name: Collect kubeconfig
+  hosts: server[0]
+  become: true
+  tasks:
+    - name: Fetch kubeconfig
+      ansible.builtin.fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: kubeconfig-proxmox
+        flat: true
+
+    - name: Point kubeconfig at the server address
+      ansible.builtin.replace:
+        path: kubeconfig-proxmox
+        regexp: '127\.0\.0\.1'
+        replace: "{{ ansible_host }}"
+      delegate_to: localhost
+      become: false

@@ -1,0 +1,198 @@
+---
+# Create or destroy k3s VMs on Proxmox and write the generated inventory.
+#   provision: PROXMOX_PASSWORD=... ansible-playbook proxmox_vms.yml -e k3s_agent_count=4
+#   destroy:   PROXMOX_PASSWORD=... ansible-playbook proxmox_vms.yml -e vm_state=absent
+- name: Manage k3s VMs on Proxmox
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    proxmox_api_host: pve
+    proxmox_api_user: root@pam
+    # from -e @proxmox_secrets.yml, else the environment
+    proxmox_api_password: "{{ vault_proxmox_password | default(lookup('env', 'PROXMOX_PASSWORD')) }}"
+    proxmox_nodes: [pve, pve2]
+    proxmox_templates: { pve: 9000, pve2: 9001 } # ZFS is node-local, so each node needs its own
+    proxmox_template_name: ubuntu-2404-k3s
+    proxmox_storage: local-zfs
+
+    vm_state: present
+    vm_name_prefix: k3s
+    vm_user: k3s
+    vm_ssh_pubkey_file: ~/.ssh/id_ed25519.pub
+    vmid_base: 200
+    vm_ip_base: 192.168.178.150
+    vm_cidr: 24
+    vm_gateway: 192.168.178.1
+    vm_nameserver: 192.168.178.1
+
+    k3s_server_count: 1
+    k3s_agent_count: 2
+    k3s_server_spec: { cores: 2, memory: 4096, disk: 32 }
+    k3s_agent_spec: { cores: 4, memory: 8192, disk: 64 }
+
+    inventory_path: inventories/proxmox/hosts.ini
+
+  module_defaults:
+    group/community.general.proxmox:
+      api_host: "{{ proxmox_api_host }}"
+      api_user: "{{ proxmox_api_user }}"
+      api_password: "{{ proxmox_api_password }}"
+      validate_certs: false
+
+  tasks:
+    - name: Check inputs
+      ansible.builtin.assert:
+        that:
+          - proxmox_api_password | length > 0
+          - k3s_server_count | int in [1, 3, 5]
+          - (vm_ip_base.split('.')[3] | int) + (k3s_server_count | int) + (k3s_agent_count | int) <= 254
+        fail_msg: >-
+          Need a Proxmox password (PROXMOX_PASSWORD or -e @proxmox_secrets.yml),
+          k3s_server_count in 1/3/5 (etcd quorum),
+          and an IP range starting at {{ vm_ip_base }} that fits all VMs.
+
+    - name: Render VM specs
+      ansible.builtin.set_fact:
+        _k3s_vms_json: >-
+          {%- set vms = [] -%}
+          {%- set octets = vm_ip_base.split('.') -%}
+          {%- set prefix = octets[0:3] | join('.') -%}
+          {%- set start = octets[3] | int -%}
+          {%- set roles = [
+                ('server', k3s_server_count | int, k3s_server_spec),
+                ('agent', k3s_agent_count | int, k3s_agent_spec)] -%}
+          {%- for role, count, spec in roles -%}
+            {%- for n in range(count) -%}
+              {%- set idx = vms | length -%}
+              {%- set _ = vms.append({
+                    'name': vm_name_prefix ~ '-' ~ role ~ '-' ~ (n + 1),
+                    'role': role,
+                    'vmid': (vmid_base | int) + idx,
+                    'node': proxmox_nodes[idx % (proxmox_nodes | length)],
+                    'cores': spec.cores,
+                    'memory': spec.memory,
+                    'disk': spec.disk,
+                    'ip': prefix ~ '.' ~ (start + idx)
+                  }) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ vms | to_json }}
+
+    - name: Load VM specs
+      ansible.builtin.set_fact:
+        k3s_vms: "{{ _k3s_vms_json | from_json }}"
+
+    - name: Provision
+      when: vm_state == 'present'
+      block:
+        - name: Clone template
+          community.general.proxmox_kvm:
+            node: "{{ item.node }}"
+            vmid: "{{ proxmox_templates[item.node] }}"
+            clone: "{{ proxmox_template_name }}"
+            newid: "{{ item.vmid }}"
+            name: "{{ item.name }}"
+            full: true
+            storage: "{{ proxmox_storage }}"
+            format: unspecified # zfspool takes raw zvols only
+            timeout: 600
+          loop: "{{ k3s_vms }}"
+          loop_control:
+            label: "{{ item.name }} -> {{ item.node }}"
+
+        - name: Apply resources and cloud-init
+          community.general.proxmox_kvm:
+            node: "{{ item.node }}"
+            vmid: "{{ item.vmid }}"
+            update: true
+            cores: "{{ item.cores }}"
+            memory: "{{ item.memory }}"
+            onboot: true
+            agent: true
+            ciuser: "{{ vm_user }}"
+            sshkeys: "{{ lookup('file', vm_ssh_pubkey_file) }}"
+            nameservers: ["{{ vm_nameserver }}"]
+            ipconfig:
+              ipconfig0: "ip={{ item.ip }}/{{ vm_cidr }},gw={{ vm_gateway }}"
+          loop: "{{ k3s_vms }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Resize root disk
+          community.general.proxmox_disk:
+            vmid: "{{ item.vmid }}"
+            disk: scsi0
+            size: "{{ item.disk }}G"
+            state: resized
+          loop: "{{ k3s_vms }}"
+          loop_control:
+            label: "{{ item.name }} -> {{ item.disk }}G"
+
+        - name: Start VMs
+          community.general.proxmox_kvm:
+            node: "{{ item.node }}"
+            vmid: "{{ item.vmid }}"
+            state: started
+          loop: "{{ k3s_vms }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Wait for SSH
+          ansible.builtin.wait_for:
+            host: "{{ item.ip }}"
+            port: 22
+            delay: 10
+            timeout: 600
+          loop: "{{ k3s_vms }}"
+          loop_control:
+            label: "{{ item.name }} ({{ item.ip }})"
+
+        - name: Ensure inventory directory exists
+          ansible.builtin.file:
+            path: "{{ inventory_path | dirname }}"
+            state: directory
+            mode: "0755"
+
+        - name: Write inventory
+          ansible.builtin.copy:
+            dest: "{{ inventory_path }}"
+            mode: "0644"
+            content: |
+              # Generated by proxmox_vms.yml - do not edit.
+              [server]
+              {% for vm in k3s_vms if vm.role == 'server' %}
+              {{ vm.name }} ansible_host={{ vm.ip }}
+              {% endfor %}
+
+              [agent]
+              {% for vm in k3s_vms if vm.role == 'agent' %}
+              {{ vm.name }} ansible_host={{ vm.ip }}
+              {% endfor %}
+
+              [k3s:children]
+              server
+              agent
+
+              [k3s:vars]
+              ansible_user={{ vm_user }}
+
+    - name: Destroy
+      when: vm_state == 'absent'
+      block:
+        - name: Remove VMs
+          community.general.proxmox_kvm:
+            node: "{{ item.node }}"
+            vmid: "{{ item.vmid }}"
+            state: absent
+            force: true
+            timeout: 300
+          loop: "{{ k3s_vms }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Drop generated inventory
+          ansible.builtin.file:
+            path: "{{ inventory_path }}"
+            state: absent

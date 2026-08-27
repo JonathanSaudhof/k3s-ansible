@@ -1,0 +1,3 @@
+kubeconfig-proxmox
+inventories/proxmox/hosts.ini
+proxmox_secrets.yml
