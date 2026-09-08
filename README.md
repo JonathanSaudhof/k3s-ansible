@@ -56,27 +56,44 @@ Make variables: `SERVERS`, `AGENTS`, `PVE_TEMPLATES`, `PVE_SSH_USER`, `TEMPLATE_
 
 ## Credentials
 
-**Proxmox API** (`make vms`, `make down`) — password auth as `root@pam`. Put it in
-`proxmox_secrets.yml`:
+Two independent channels:
 
-```yaml
-vault_proxmox_password: <password>
-```
+| Channel | Used by | Auth |
+| --- | --- | --- |
+| Proxmox API | `make vms` / `make down` | API token (recommended) or password |
+| SSH to the nodes | `make template` | SSH key |
 
-Then `ansible-vault encrypt proxmox_secrets.yml` and pass `ANSIBLE_EXTRA=--ask-vault-pass`.
-The Makefile includes the file automatically when it exists; without it, the
-`PROXMOX_PASSWORD` environment variable is used.
+### API token
 
-**SSH to the nodes** (`make template`) — key auth, set up once:
+Create a dedicated user and token on a Proxmox node. `--privsep 0` lets the token inherit
+the user's roles instead of needing its own ACLs.
 
 ```sh
-ssh-keygen -t ed25519
-ssh-copy-id root@pve
-ssh-copy-id root@pve2
+pveum user add ansible@pve
+pveum acl modify /                        --user ansible@pve --role PVEVMAdmin
+pveum acl modify /storage                 --user ansible@pve --role PVEDatastoreUser
+pveum acl modify /sdn/zones/localnetwork  --user ansible@pve --role PVESDNUser
+pveum user token add ansible@pve k3s --privsep 0
 ```
 
-`ssh-copy-id` asks for the root password once; after that SSH uses the key. The same key is
-what cloud-init injects into every k3s VM.
+The secret is printed **once**. Put it in `proxmox_secrets.yml`:
+
+```yaml
+vault_proxmox_user: ansible@pve
+vault_proxmox_token_id: k3s
+vault_proxmox_token_secret: <the printed secret>
+```
+
+Then `ansible-vault encrypt proxmox_secrets.yml`. The Makefile includes the file
+automatically when it exists; add `ANSIBLE_EXTRA=--ask-vault-pass` once it's encrypted.
+
+Env-var equivalents, if you'd rather not keep a file: `PROXMOX_TOKEN_ID`,
+`PROXMOX_TOKEN_SECRET`, plus `-e proxmox_api_user=ansible@pve`.
+
+### Password fallback
+
+Without a token, `vault_proxmox_password` / `PROXMOX_PASSWORD` is used with
+`proxmox_api_user` (default `root@pam`).
 
 `proxmox_secrets.yml` and the generated kubeconfig are gitignored.
 

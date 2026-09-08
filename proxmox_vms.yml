@@ -8,19 +8,23 @@
   gather_facts: false
 
   vars:
-    proxmox_api_host: pve
-    proxmox_api_user: root@pam
-    # from -e @proxmox_secrets.yml, else the environment
-    proxmox_api_password: "{{ vault_proxmox_password | default(lookup('env', 'PROXMOX_PASSWORD')) }}"
+    proxmox_api_host: 192.168.178.15
+    proxmox_api_user: "{{ vault_proxmox_user | default('root@pam') }}"
+    # Token is preferred; password is the fallback. From -e @proxmox_secrets.yml, else the environment.
+    proxmox_api_token_id: "{{ vault_proxmox_token_id | default(lookup('env', 'PROXMOX_TOKEN_ID')) }}"
+    proxmox_api_token_secret: "{{ vault_proxmox_token_secret | default(lookup('env', 'PROXMOX_TOKEN_SECRET')) }}"
+    proxmox_api_password: >-
+      {{ '' if (proxmox_api_token_id | length > 0 and proxmox_api_token_secret | length > 0)
+         else vault_proxmox_password | default(lookup('env', 'PROXMOX_PASSWORD')) }}
     proxmox_nodes: [pve, pve2]
-    proxmox_templates: { pve: 9000, pve2: 9001 } # ZFS is node-local, so each node needs its own
+    proxmox_templates: { pve: 9001, pve2: 9002 } # ZFS is node-local, so each node needs its own
     proxmox_template_name: ubuntu-2404-k3s
     proxmox_storage: local-zfs
 
     vm_state: present
     vm_name_prefix: k3s
     vm_user: k3s
-    vm_ssh_pubkey_file: ~/.ssh/id_ed25519.pub
+    vm_ssh_pubkey_file: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
     vmid_base: 200
     vm_ip_base: 192.168.178.150
     vm_cidr: 24
@@ -38,19 +42,22 @@
     group/community.general.proxmox:
       api_host: "{{ proxmox_api_host }}"
       api_user: "{{ proxmox_api_user }}"
-      api_password: "{{ proxmox_api_password }}"
+      api_token_id: "{{ proxmox_api_token_id  or omit }}"
+      api_token_secret: "{{ proxmox_api_token_secret or omit }}"
+      api_password: "{{ proxmox_api_password or omit }}"
       validate_certs: false
 
   tasks:
     - name: Check inputs
       ansible.builtin.assert:
         that:
-          - proxmox_api_password | length > 0
+          - (proxmox_api_token_id | length > 0 and proxmox_api_token_secret | length > 0)
+            or proxmox_api_password | length > 0
           - k3s_server_count | int in [1, 3, 5]
           - (vm_ip_base.split('.')[3] | int) + (k3s_server_count | int) + (k3s_agent_count | int) <= 254
         fail_msg: >-
-          Need a Proxmox password (PROXMOX_PASSWORD or -e @proxmox_secrets.yml),
-          k3s_server_count in 1/3/5 (etcd quorum),
+          Need Proxmox credentials (an API token, or a password) via -e @proxmox_secrets.yml
+          or the environment, k3s_server_count in 1/3/5 (etcd quorum),
           and an IP range starting at {{ vm_ip_base }} that fits all VMs.
 
     - name: Render VM specs

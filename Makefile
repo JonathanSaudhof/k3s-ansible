@@ -2,7 +2,13 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 PVE_SSH_USER  ?= root
-PVE_TEMPLATES ?= pve:9000 pve2:9001
+# SSH password for the Proxmox nodes; empty means key/agent auth. Needs sshpass.
+# Pass it per run (PVE_SSH_PASSWORD=... make vms) or via proxmox_secrets.yml - never commit it.
+PVE_SSH_PASSWORD ?=
+export PVE_SSH_PASSWORD
+export SSHPASS := $(PVE_SSH_PASSWORD)
+SSH := $(if $(PVE_SSH_PASSWORD),sshpass -e ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,ssh) -o StrictHostKeyChecking=accept-new
+PVE_TEMPLATES ?= 192.168.178.15:9001 192.168.178.16:9002
 SERVERS       ?= 1
 AGENTS        ?= 2
 KUBECONFIG_OUT := kubeconfig-proxmox
@@ -31,10 +37,12 @@ check: ## Syntax-check the script and both playbooks
 	ansible-playbook install_k3s.yml --syntax-check
 
 template: ## Build the VM template on every Proxmox node, over SSH
-	@for t in $(PVE_TEMPLATES); do \
+	@if [ -n "$(PVE_SSH_PASSWORD)" ] && ! command -v sshpass >/dev/null; then \
+		echo "PVE_SSH_PASSWORD is set but sshpass is not installed"; exit 1; \
+	fi	@for t in $(PVE_TEMPLATES); do \
 		node=$${t%%:*}; vmid=$${t##*:}; \
 		echo "==> $$node (vmid $$vmid)"; \
-		ssh $(PVE_SSH_USER)@$$node "bash -s -- --vmid $$vmid $(TEMPLATE_ARGS)" \
+		$(SSH) $(PVE_SSH_USER)@$$node "bash -s -- --vmid $$vmid $(TEMPLATE_ARGS)" \
 			< scripts/create-k3s-template.sh || exit 1; \
 	done
 
