@@ -17,7 +17,10 @@ INVENTORY     := inventories/proxmox/hosts.ini
 TEMPLATE_ARGS ?=
 ANSIBLE_EXTRA ?=
 SECRETS       := $(wildcard proxmox_secrets.yml)
-VARS = -e k3s_server_count=$(SERVERS) -e k3s_agent_count=$(AGENTS) \
+# Only override the VM counts when SERVERS/AGENTS were actually passed in; otherwise
+# proxmox_vms.yml derives them from the existing inventories/proxmox/hosts.ini.
+VARS = $(if $(filter command\ line environment,$(origin SERVERS)),-e k3s_server_count=$(SERVERS)) \
+       $(if $(filter command\ line environment,$(origin AGENTS)),-e k3s_agent_count=$(AGENTS)) \
        $(if $(SECRETS),-e @proxmox_secrets.yml) $(ANSIBLE_EXTRA)
 
 .PHONY: help deps check template vms k3s up down nodes shell clean
@@ -54,7 +57,7 @@ k3s: ## Install k3s on the provisioned VMs
 
 up: vms k3s ## Provision VMs and install k3s
 
-# SERVERS/AGENTS must match the values used for `up` so the same VMIDs are targeted.
+# Without SERVERS/AGENTS, targets whatever's currently in the inventory.
 down: ## Destroy the k3s VMs (templates are kept)
 	ansible-playbook proxmox_vms.yml -e vm_state=absent $(VARS)
 

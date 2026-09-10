@@ -26,14 +26,16 @@ Then pass `ANSIBLE_EXTRA=--ask-vault-pass` to any target that talks to the Proxm
 make template                     # build the VM template on pve (9000) and pve2 (9001)
 make up SERVERS=3 AGENTS=4        # create VMs, then install k3s
 make nodes                        # kubectl get nodes -o wide
-make down SERVERS=3 AGENTS=4      # destroy the VMs; templates are kept
+make down                         # destroy the VMs; templates are kept
 ```
 
 `make template` only needs to run once per node. Re-running is a no-op unless you pass
 `TEMPLATE_ARGS=--force`.
 
-> `make down` recomputes VMIDs from `SERVERS`/`AGENTS`, so pass the same values you used
-> for `up`, or it will target the wrong VMs. Set the defaults in the `Makefile` to avoid this.
+> `SERVERS`/`AGENTS` only matter the first time (or to grow/shrink the cluster). Once
+> `inventories/proxmox/hosts.ini` exists, `proxmox_vms.yml` derives the counts, names,
+> VMIDs and nodes from it, so plain `make down` (no args) targets exactly what's there.
+
 
 ### All targets
 
@@ -103,15 +105,19 @@ Defaults live in the `vars:` block of `proxmox_vms.yml`; override any of them wi
 
 | Variable | Default | |
 | --- | --- | --- |
+| `k3s_server_count` / `k3s_agent_count` | count of `[server]`/`[agent]` in the existing inventory, else `3`/`0` | |
 | `proxmox_nodes` | `[pve, pve2]` | VMs are placed round-robin across these |
 | `proxmox_templates` | `{pve: 9000, pve2: 9001}` | ZFS is node-local, so each node needs its own template |
 | `proxmox_storage` | `local-zfs` | |
-| `vmid_base` | `200` | VMIDs are assigned sequentially from here |
-| `vm_ip_base` | `192.168.178.150` | Static IPs assigned sequentially from here |
+| `vmid_base` | `200` | VMIDs are assigned sequentially from here, for new VMs only |
+| `vm_ip_base` | `192.168.178.150` | Static IPs assigned sequentially from here, for new VMs only |
 | `vm_gateway` / `vm_nameserver` | `192.168.178.1` | |
 | `vm_user` | `k3s` | |
 | `k3s_server_spec` | `{cores: 2, memory: 4096, disk: 32}` | |
 | `k3s_agent_spec` | `{cores: 4, memory: 8192, disk: 64}` | |
+
+Existing hosts keep their name, IP, VMID and node across re-runs (read back from
+`inventories/proxmox/hosts.ini`); only newly added hosts get generated values.
 
 ```sh
 make vms SERVERS=3 AGENTS=4 \
