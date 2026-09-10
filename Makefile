@@ -23,7 +23,7 @@ VARS = $(if $(filter command\ line environment,$(origin SERVERS)),-e k3s_server_
        $(if $(filter command\ line environment,$(origin AGENTS)),-e k3s_agent_count=$(AGENTS)) \
        $(if $(SECRETS),-e @proxmox_secrets.yml) $(ANSIBLE_EXTRA)
 
-.PHONY: help deps check template vms k3s up down nodes shell clean
+.PHONY: help deps check template vms k3s up down nodes nfs-client shell clean
 
 help: ## Show this help
 	@echo "Usage: make <target> [SERVERS=3] [AGENTS=4] [ANSIBLE_EXTRA=--ask-vault-pass]"
@@ -63,6 +63,9 @@ down: ## Destroy the k3s VMs (templates are kept)
 
 nodes: ## Show the k3s cluster nodes
 	KUBECONFIG=$(KUBECONFIG_OUT) kubectl get nodes -o wide
+
+nfs-client: ## Mount the NFS share on all k3s nodes
+	ansible-playbook -i $(INVENTORY) setup_nfs_client.yml $(ANSIBLE_EXTRA)
 
 shell: ## SSH into the first k3s server
 	@ssh k3s@$$(awk '/ansible_host=/{sub(/.*ansible_host=/, ""); print $$1; exit}' $(INVENTORY))

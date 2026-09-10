@@ -1,0 +1,72 @@
+---
+- name: Setup NFS Shared Storage
+  hosts: k3s
+  become: yes
+  vars:
+    nfs_server: 192.168.178.3
+    nfs_export_path: /mnt/user/k3s
+    nfs_mount_point: /mnt/nfs
+
+  tasks:
+    - name: Install NFS client packages
+      apt:
+        name:
+          - nfs-common
+        state: present
+        update_cache: yes
+
+    - name: Create NFS mount directory
+      shell: mkdir -p "{{ nfs_mount_point }}" || true
+      changed_when: false
+
+    # "Stale file handle" errors occur when the NFS server was restarted or the export changed
+    - name: Force unmount stale NFS mount if present
+      shell: |
+        MOUNT="{{ nfs_mount_point }}"
+        if mountpoint -q "$MOUNT" 2>/dev/null || mount | grep -q "$MOUNT"; then
+          umount -f "$MOUNT" 2>/dev/null || umount -l "$MOUNT" 2>/dev/null || true
+        fi
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Mount NFS share
+      shell: |
+        MOUNT="{{ nfs_mount_point }}"
+        NFS_SERVER="{{ nfs_server }}"
+        NFS_PATH="{{ nfs_export_path }}"
+
+        if ! grep -q "$NFS_SERVER:$NFS_PATH" /etc/fstab; then
+          echo "$NFS_SERVER:$NFS_PATH $MOUNT nfs defaults,nofail,noatime 0 0" >> /etc/fstab
+        fi
+
+        mount "$MOUNT"
+      register: nfs_mount
+
+    - name: Verify NFS mount
+      shell: "df -h {{ nfs_mount_point }} | tail -1"
+      register: nfs_verify
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display NFS mount verification
+      debug:
+        msg: "{{ nfs_verify.stdout }}"
+      when: nfs_verify.rc == 0
+
+    - name: Display storage setup summary
+      debug:
+        msg:
+          - "=========================================="
+          - "NFS Storage Setup Complete!"
+          - "=========================================="
+          - ""
+          - "NFS Mount (All Nodes):"
+          - "  Mount Point: {{ nfs_mount_point }}"
+          - "  NFS Server: {{ nfs_server }}"
+          - "  Export Path: {{ nfs_export_path }}"
+          - ""
+          - "Next steps:"
+          - "  1. Verify mount: df -h {{ nfs_mount_point }}"
+          - "  2. In ../k3s-configuration: make install-nfs-provisioner"
+          - "  3. Update app values to use the nfs-storage StorageClass"
+          - "=========================================="
