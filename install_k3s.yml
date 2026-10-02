@@ -13,6 +13,44 @@
         update_cache: true
         cache_valid_time: 3600
 
+# MetalLB provides LoadBalancer IPs; k3s' built-in ServiceLB (svclb pods) would
+# otherwise grab hostPorts on every node and conflict with it.
+- name: Configure k3s servers
+  hosts: server
+  become: true
+  serial: 1
+  tasks:
+    - name: Ensure k3s config directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Write k3s server config
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        mode: "0644"
+        content: |
+          disable:
+            - servicelb
+      register: k3s_config
+
+    - name: Check whether k3s is already installed
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k3s.service
+      register: k3s_service
+
+    - name: Restart k3s to apply config
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+      when: k3s_config.changed and k3s_service.stat.exists
+
+    - name: Wait for node to become Ready after restart
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node/{{ ansible_hostname }} --timeout=300s
+      changed_when: false
+      when: k3s_config.changed and k3s_service.stat.exists
+
 - name: Bootstrap first k3s server
   hosts: server[0]
   become: true
