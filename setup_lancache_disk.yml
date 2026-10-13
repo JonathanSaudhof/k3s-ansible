@@ -1,0 +1,49 @@
+---
+# Grows the root filesystem of k3s-server-2 into its resized scsi0 disk (k3s_disk_overrides in
+# proxmox_vms.yml, applied by `make vms`) and creates the lancache cache/log directories on it.
+- name: Setup Lancache storage
+  hosts: k3s-server-2
+  become: yes
+  vars:
+    lancache_dir: /mnt/lancache
+
+  tasks:
+    - name: Find root partition
+      shell: findmnt -no SOURCE /
+      register: root_part
+      changed_when: false
+
+    - name: Rescan disk so the kernel sees the new size
+      shell: |
+        DISK=$(lsblk -no PKNAME "{{ root_part.stdout }}")
+        echo 1 > /sys/class/block/$DISK/device/rescan
+      changed_when: false
+
+    # growpart exits 1 with NOCHANGE when the partition already fills the disk
+    - name: Grow root partition
+      shell: |
+        DISK=/dev/$(lsblk -no PKNAME "{{ root_part.stdout }}")
+        PART=$(cat /sys/class/block/$(basename "{{ root_part.stdout }}")/partition)
+        growpart "$DISK" "$PART"
+      register: growpart
+      changed_when: growpart.rc == 0
+      failed_when: growpart.rc != 0 and 'NOCHANGE' not in growpart.stdout
+
+    - name: Grow root filesystem
+      shell: resize2fs "{{ root_part.stdout }}"
+      when: growpart is changed
+
+    - name: Create cache and logs directories
+      file:
+        path: "{{ lancache_dir }}/{{ item }}"
+        state: directory
+      loop: [cache, logs]
+
+    - name: Verify size
+      shell: "df -h {{ lancache_dir }} | tail -1"
+      register: lancache_verify
+      changed_when: false
+
+    - name: Display size
+      debug:
+        msg: "{{ lancache_verify.stdout }}"

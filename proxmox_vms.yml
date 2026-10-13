@@ -30,6 +30,10 @@
     vm_cidr: 24
     vm_gateway: 192.168.178.1
     vm_nameserver: 192.168.178.1
+    # Without an explicit search domain Proxmox injects the host's (ez-lab.de), whose wildcard
+    # record hijacks every pod lookup (ndots:5 tries api.steampowered.com.ez-lab.de first).
+    # home.arpa is the RFC 8375 home-network domain and has no public records.
+    vm_searchdomain: home.arpa
 
     # Defaults to what's already in inventory_path (so a hand-edited hosts.ini drives
     # count and naming); falls back to 3/0 when there's no existing inventory. Override
@@ -38,6 +42,9 @@
     k3s_agent_count: "{{ groups['agent'] | default([]) | length or 0 }}"
     k3s_server_spec: { cores: 4, memory: 8192, disk: 64 }
     k3s_agent_spec: { cores: 4, memory: 8192, disk: 64 }
+    # Per-VM root disk size (GB), overriding the spec. k3s-server-2 sits on pve2's 1TB SSD and
+    # holds the lancache cache at /mnt/lancache (see setup_lancache_disk.yml). Disks only grow.
+    k3s_disk_overrides: { k3s-server-2: 511 }
 
     inventory_path: inventories/proxmox/hosts.ini
 
@@ -78,14 +85,15 @@
               {%- set idx = vms | length -%}
               {%- set existing_name = existing[n] if n < (existing | length) else '' -%}
               {%- set hv = hostvars[existing_name] if existing_name else {} -%}
+              {%- set name = existing_name if existing_name else (vm_name_prefix ~ '-' ~ role ~ '-' ~ (n + 1)) -%}
               {%- set _ = vms.append({
-                    'name': existing_name if existing_name else (vm_name_prefix ~ '-' ~ role ~ '-' ~ (n + 1)),
+                    'name': name,
                     'role': role,
                     'vmid': hv.proxmox_vmid | default((vmid_base | int) + idx) | int,
                     'node': hv.proxmox_node | default(proxmox_nodes[idx % (proxmox_nodes | length)]),
                     'cores': spec.cores,
                     'memory': spec.memory,
-                    'disk': spec.disk,
+                    'disk': k3s_disk_overrides[name] | default(spec.disk),
                     'ip': hv.ansible_host | default(prefix ~ '.' ~ (start + idx))
                   }) -%}
             {%- endfor -%}
@@ -126,6 +134,7 @@
             ciuser: "{{ vm_user }}"
             sshkeys: "{{ lookup('file', vm_ssh_pubkey_file) }}"
             nameservers: ["{{ vm_nameserver }}"]
+            searchdomains: ["{{ vm_searchdomain }}"]
             ipconfig:
               ipconfig0: "ip={{ item.ip }}/{{ vm_cidr }},gw={{ vm_gateway }}"
           loop: "{{ k3s_vms }}"
