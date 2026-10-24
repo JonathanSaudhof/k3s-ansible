@@ -74,8 +74,13 @@ clean: ## Remove the generated inventory and kubeconfig
 	rm -f $(KUBECONFIG_OUT) $(INVENTORY)
 
 # --- Hetzner (OpenTofu in hetzner/) ---------------------------------------------------------
-# Reuses the existing server vm-k3s. Needs HCLOUD_TOKEN, curl and jq, and hetzner/terraform.tfvars
-# (see the .example). Order: init -> import -> plan -> rebuild -> bootstrap -> apply.
+# Reuses the existing server vm-k3s. Needs curl, jq, hetzner/terraform.tfvars (see the .example) and
+# HCLOUD_TOKEN from .env (gitignored, see .env.example); a value there overrides the environment.
+# Order: init -> import -> plan -> rebuild -> bootstrap -> apply.
+# `-include`: .env is optional, the token can also come from the environment.
+-include .env
+HCLOUD_TOKEN ?=
+export HCLOUD_TOKEN
 TOFU               := tofu -chdir=hetzner
 HCLOUD             := hetzner/scripts/hcloud.sh
 HETZNER_SERVER     ?= vm-k3s

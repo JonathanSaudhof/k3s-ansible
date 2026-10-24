@@ -5,3 +5,5 @@ hetzner/.terraform/
 hetzner/*.tfstate
 hetzner/*.tfstate.*
 hetzner/terraform.tfvars
+.env*
+!.env.example

@@ -9,6 +9,5 @@ terraform {
   }
 }
 
-# Reads the API token from HCLOUD_TOKEN, e.g.:
-#   export HCLOUD_TOKEN=$(op read op://k3s/hetzner/token)
+# Reads the API token from HCLOUD_TOKEN, which the Makefile loads from ../.env.
 provider "hcloud" {}

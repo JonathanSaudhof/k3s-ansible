@@ -160,10 +160,11 @@ only runs when a server is created.
 Prerequisites:
 - `opentofu`, `helm`, `kubectl`, `curl` and `jq`.
 - The `ez-lab.de` zone in the Hetzner Console DNS, in the same project as `vm-k3s`.
-- An API token for that project with read/write access.
+- An API token for that project with read/write access, in `.env` as `HCLOUD_TOKEN=...`
+  (`cp .env.example .env`; gitignored, read by the Makefile and exported to tofu and the scripts).
 
 ```sh
-export HCLOUD_TOKEN=$(op read op://k3s/hetzner/token)
+cp .env.example .env                # then set HCLOUD_TOKEN
 cp hetzner/terraform.tfvars.example hetzner/terraform.tfvars
 make hetzner-init
 make hetzner-import               # prints vm-k3s' type and location; put both into terraform.tfvars
