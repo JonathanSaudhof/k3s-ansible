@@ -1,2 +1,7 @@
 kubeconfig-proxmox
 proxmox_secrets.yml
+kubeconfig-hetzner
+hetzner/.terraform/
+hetzner/*.tfstate
+hetzner/*.tfstate.*
+hetzner/terraform.tfvars

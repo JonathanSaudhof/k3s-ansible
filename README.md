@@ -128,6 +128,81 @@ make vms SERVERS=3 AGENTS=4 \
 `SERVERS` must be 1, 3 or 5 — etcd needs an odd number for quorum. With 1 server there is
 no control-plane HA.
 
+## Hetzner (public VM)
+
+`hetzner/` turns the existing Hetzner Cloud server **`vm-k3s`** into a single public k3s node running
+[Pangolin](https://github.com/fosrl/pangolin), the reverse proxy / tunnel server for public pet projects.
+OpenTofu imports the server and its primary IPs instead of creating new ones, and manages its firewall,
+DNS records and settings. The OS is wiped and reinstalled through the Hetzner API
+(`scripts/hcloud.sh rebuild`). `scripts/bootstrap.sh` then sets it up over SSH, because cloud-init
+only runs when a server is created.
+
+- **Firewall** (Hetzner Cloud Firewall): only these ports are open, from anywhere:
+  - TCP 1337 (SSH, key only)
+  - TCP 80 and 443 (Traefik)
+  - UDP 51820 and 21820 (Gerbil WireGuard: Newt sites and clients)
+  - ICMP
+  Port 22 and the k3s API (6443) are closed; reach the API with `make hetzner-tunnel`.
+- **IPs and DNS**: the server's existing primary IPs are imported and set to `auto_delete = false`.
+  `pangolin.ez-lab.de`, plus one name per entry in `public_subdomains`, get A and AAAA records in the
+  existing `ez-lab.de` zone. Only those records are managed; the home records in the same zone are
+  untouched and there's no wildcard.
+- **Bootstrap** (`hetzner/scripts/bootstrap.sh`, runs as root):
+  - creates the `k3s` sudo user with root's SSH keys (Hetzner re-injects the keys from server creation on rebuild)
+  - enables unattended-upgrades with reboots at 04:00
+  - installs k3s and configures its bundled Traefik with a `letsencrypt` resolver (HTTP-01, ACME state on a PVC)
+  - moves sshd to port 1337, key only, with root login off
+- **Pangolin** (`hetzner/helm-values/pangolin-values.yaml`): uses the fossorial chart in controller mode,
+  where pangolin-kube-controller writes Traefik IngressRoutes. The database is CloudNativePG
+  (1 instance, `local-path`).
+  The chart is a **pre-release** (`0.1.0-alpha.1`, pinned in the Makefile): run `helm template` before bumping it.
+
+Prerequisites:
+- `opentofu`, `helm`, `kubectl`, `curl` and `jq`.
+- The `ez-lab.de` zone in the Hetzner Console DNS, in the same project as `vm-k3s`.
+- An API token for that project with read/write access.
+
+```sh
+export HCLOUD_TOKEN=$(op read op://k3s/hetzner/token)
+cp hetzner/terraform.tfvars.example hetzner/terraform.tfvars
+make hetzner-init
+make hetzner-import               # prints vm-k3s' type and location; put both into terraform.tfvars
+make hetzner-plan                 # expect: firewall + DNS added, server/IPs updated in place, 0 destroyed
+make hetzner-rebuild              # WIPES vm-k3s, reinstalls Ubuntu 24.04 (asks for confirmation)
+make hetzner-bootstrap ACME_EMAIL=you@example.com   # over port 22, before apply closes it
+make hetzner-apply                # firewall (22 closed), IP settings, DNS records
+make hetzner-tunnel               # separate terminal; forwards the API to localhost:16443
+make hetzner-kubeconfig           # writes kubeconfig-hetzner
+KUBECONFIG=kubeconfig-hetzner kubectl get nodes
+make hetzner-install-cnpg
+make hetzner-install-pangolin
+make hetzner-pangolin-setup-token # then open https://pangolin.ez-lab.de/auth/initial-setup
+make hetzner-pangolin-ready       # starts Gerbil once the admin account exists
+make hetzner-shell                # ssh -p 1337 k3s@<ip>
+```
+
+Notes:
+- **Check the plan before applying.** If `hetzner-plan` wants to replace `hcloud_server.k3s`, fix
+  `terraform.tfvars` first (usually `location`). `prevent_destroy` makes tofu refuse a replacement anyway.
+  A different `server_type` resizes the server, which means a short downtime.
+- **Changing the SSH port or admin user:** change them in `variables.tf` *and* in
+  `HETZNER_SSH_PORT`/`HETZNER_ADMIN` in the Makefile. `hetzner-rebuild` and `hetzner-bootstrap` run before
+  the first apply, when there are no tofu outputs yet.
+- **Hetzner returns a root password on rebuild** if `vm-k3s` was created without SSH keys. Then add your
+  key to `/root/.ssh/authorized_keys` through the Hetzner console before bootstrapping.
+- **Old cloud-init data:** the rebuild may re-run the server's original creation-time user_data on first
+  boot. Bootstrap overrides the relevant settings.
+- `pangolin-app-secret` (`SERVER_SECRET`) is generated once and only exists in the cluster.
+  Copy it to 1Password:
+  `KUBECONFIG=kubeconfig-hetzner kubectl get secret pangolin-app-secret -n pangolin -o jsonpath='{.data.SERVER_SECRET}' | base64 -d`
+- To publish an app, add its subdomain to `public_subdomains`, run `make hetzner-apply`, and create the
+  resource in Pangolin. In-cluster services are reachable from a local site via `<svc>.<ns>.svc.cluster.local`.
+  Apps elsewhere connect through Newt (`fossorial/newt` chart, or the binary).
+- There's no destroy target: the server is reused, and `prevent_destroy` protects it. To give it up,
+  remove the lifecycle block deliberately.
+- State is local (`hetzner/terraform.tfstate`, gitignored) and holds no secrets. Back it up, or move it
+  to a remote backend.
+
 ## Layout
 
 ```
@@ -139,6 +214,8 @@ setup_nfs_client.yml              mount the NFS share on all k3s nodes (node-lev
 scripts/create-k3s-template.sh    build the cloud-init template (runs on a Proxmox node)
 inventories/proxmox/hosts.ini     generated by `make vms`
 kubeconfig-proxmox                generated by `make k3s`
+hetzner/                         OpenTofu, bootstrap script and Pangolin config for vm-k3s on Hetzner
+kubeconfig-hetzner                generated by `make hetzner-kubeconfig`
 ```
 
 `hosts.ini` and `prepare_my_cluster.yml` are the parked Raspberry Pi cluster. Nothing

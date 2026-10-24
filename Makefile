@@ -72,3 +72,100 @@ shell: ## SSH into the first k3s server
 
 clean: ## Remove the generated inventory and kubeconfig
 	rm -f $(KUBECONFIG_OUT) $(INVENTORY)
+
+# --- Hetzner (OpenTofu in hetzner/) ---------------------------------------------------------
+# Reuses the existing server vm-k3s. Needs HCLOUD_TOKEN, curl and jq, and hetzner/terraform.tfvars
+# (see the .example). Order: init -> import -> plan -> rebuild -> bootstrap -> apply.
+TOFU               := tofu -chdir=hetzner
+HCLOUD             := hetzner/scripts/hcloud.sh
+HETZNER_SERVER     ?= vm-k3s
+# Let's Encrypt account email for Traefik; only needed by hetzner-bootstrap.
+ACME_EMAIL         ?=
+# rebuild/bootstrap run before the first apply, when there are no tofu outputs yet; keep these in
+# sync with ssh_port/admin_user in hetzner/variables.tf.
+HETZNER_SSH_PORT   ?= 1337
+HETZNER_ADMIN      ?= k3s
+HETZNER_KUBECONFIG := kubeconfig-hetzner
+# Local port the k3s API is forwarded to; 6443 is closed on the public IP.
+HETZNER_API_PORT   ?= 16443
+PANGOLIN_VERSION   := 0.1.0-alpha.1
+CNPG_VERSION       ?= 0.28.0
+tf_out  = $$($(TOFU) output -raw $(1))
+SSH_HZ  = ssh -p $(call tf_out,ssh_port) $(call tf_out,admin_user)@$(call tf_out,public_ipv4)
+KUBE_HZ = KUBECONFIG=$(HETZNER_KUBECONFIG)
+# pangolin-kube-controller's NetworkPolicy has to allow the API server, which k3s serves on the
+# node's public IP; gerbil.startupMode is passed per target.
+PANGOLIN_HELM = $(KUBE_HZ) helm upgrade --install pangolin fossorial/pangolin \
+	--version $(PANGOLIN_VERSION) --namespace pangolin \
+	--values hetzner/helm-values/pangolin-values.yaml \
+	--set networkPolicy.controller.egress.kubernetesApi.cidr=$(call tf_out,public_ipv4)/32 \
+	--set networkPolicy.controller.egress.kubernetesApi.port=6443
+
+.PHONY: hetzner-init hetzner-import hetzner-plan hetzner-rebuild hetzner-bootstrap hetzner-apply hetzner-shell hetzner-kubeconfig hetzner-tunnel \
+	hetzner-install-cnpg hetzner-install-pangolin hetzner-pangolin-setup-token hetzner-pangolin-ready
+
+hetzner-init: ## Hetzner: install the OpenTofu providers
+	$(TOFU) init
+
+hetzner-import: ## Hetzner: import vm-k3s and its primary IPs into tofu state
+	$(HCLOUD) import $(HETZNER_SERVER)
+
+hetzner-plan: ## Hetzner: show what tofu would change
+	$(TOFU) plan
+
+# WARNING: erases all data on the server (asks for the server name to confirm).
+hetzner-rebuild: ## Hetzner: wipe vm-k3s and reinstall Ubuntu 24.04
+	SSH_PORT=$(HETZNER_SSH_PORT) $(HCLOUD) rebuild $(HETZNER_SERVER)
+
+# Runs as root on port 22, so do it before hetzner-apply closes 22. The script ends by moving sshd
+# to the custom port and turning root login off.
+hetzner-bootstrap: ## Hetzner: harden the rebuilt server and install k3s (ACME_EMAIL=...)
+	@test -n "$(ACME_EMAIL)" || { echo "ACME_EMAIL is required"; exit 1; }
+	ssh -o StrictHostKeyChecking=accept-new root@$$($(HCLOUD) ip $(HETZNER_SERVER)) \
+		ADMIN_USER=$(HETZNER_ADMIN) SSH_PORT=$(HETZNER_SSH_PORT) ACME_EMAIL=$(ACME_EMAIL) \
+		bash -s < hetzner/scripts/bootstrap.sh
+
+hetzner-apply: ## Hetzner: apply firewall, IPs, DNS and server settings
+	$(TOFU) apply
+
+hetzner-shell: ## Hetzner: SSH into the VM (port 1337, key only)
+	$(SSH_HZ)
+
+hetzner-kubeconfig: ## Hetzner: fetch the kubeconfig (use with hetzner-tunnel)
+	$(SSH_HZ) sudo cat /etc/rancher/k3s/k3s.yaml \
+		| sed 's#https://127.0.0.1:6443#https://127.0.0.1:$(HETZNER_API_PORT)#; s#: default$$#: hetzner#' \
+		> $(HETZNER_KUBECONFIG)
+	chmod 600 $(HETZNER_KUBECONFIG)
+
+hetzner-tunnel: ## Hetzner: forward the k3s API to localhost:16443 (keep running)
+	$(SSH_HZ) -N -L $(HETZNER_API_PORT):127.0.0.1:6443
+
+hetzner-install-cnpg: ## Hetzner: install the CloudNativePG operator
+	helm repo add cnpg https://cloudnative-pg.github.io/charts # no-op when already added
+	helm repo update cnpg
+	$(KUBE_HZ) helm upgrade --install cnpg cnpg/cloudnative-pg \
+		--version $(CNPG_VERSION) --namespace cnpg-system --create-namespace \
+		--wait --timeout 5m
+	$(KUBE_HZ) kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=300s
+
+# First install: Gerbil stays at 0 replicas until the admin account exists (hetzner-pangolin-ready).
+hetzner-install-pangolin: ## Hetzner: install Pangolin (needs hetzner-install-cnpg)
+	helm repo add fossorial https://charts.fossorial.io # no-op when already added
+	helm repo update fossorial
+	$(KUBE_HZ) kubectl apply -k hetzner/apps/pangolin
+	@# Created once so the secret never rotates on re-runs; back it up to 1Password.
+	@if ! $(KUBE_HZ) kubectl get secret pangolin-app-secret -n pangolin >/dev/null 2>&1; then \
+		$(KUBE_HZ) kubectl create secret generic pangolin-app-secret -n pangolin \
+			--from-literal=SERVER_SECRET="$$(openssl rand -hex 32)"; \
+	fi
+	$(PANGOLIN_HELM) --set gerbil.startupMode=delayed --wait --timeout 10m
+	$(KUBE_HZ) kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=pangolin -n pangolin --timeout=300s
+	@echo "Open https://$(call tf_out,pangolin_host)/auth/initial-setup, token: make hetzner-pangolin-setup-token"
+
+hetzner-pangolin-setup-token: ## Hetzner: print Pangolin's first-run setup token
+	$(KUBE_HZ) kubectl logs -n pangolin deploy/pangolin -c pangolin \
+		| sed -n '/SETUP TOKEN GENERATED/,/================================/p'
+
+hetzner-pangolin-ready: ## Hetzner: start Gerbil after the Pangolin initial setup
+	$(PANGOLIN_HELM) --set gerbil.startupMode=normal --wait --timeout 10m
+	$(KUBE_HZ) kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=gerbil -n pangolin --timeout=300s
