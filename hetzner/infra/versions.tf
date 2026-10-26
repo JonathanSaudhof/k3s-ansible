@@ -9,5 +9,5 @@ terraform {
   }
 }
 
-# Reads the API token from HCLOUD_TOKEN, which the Makefile loads from ../.env.
+# Reads the API token from HCLOUD_TOKEN, which the Makefile loads from ../../.env.
 provider "hcloud" {}

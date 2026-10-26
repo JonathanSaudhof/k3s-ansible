@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # Hetzner Cloud API helpers for reusing an existing server, driven by the Makefile.
-#   hcloud.sh ip      <server>   print the server's public IPv4
-#   hcloud.sh import  <server>   import the server and its primary IPs into OpenTofu state
-#   hcloud.sh rebuild <server>   WIPE the server's disk and reinstall ubuntu-24.04
-# Needs HCLOUD_TOKEN, curl and jq.
+#   hcloud.sh ip        <server>         print the server's public IPv4
+#   hcloud.sh import    <server>         import the server and its primary IPs into OpenTofu state
+#   hcloud.sh rebuild   <server> [--yes] WIPE the server's disk and reinstall ubuntu-24.04
+#   hcloud.sh bootstrap <server>         run bootstrap.sh on it and write the kubeconfig
+# Needs HCLOUD_TOKEN, curl and jq. rebuild/bootstrap are run by tofu (infra/main.tf); --yes skips
+# the confirmation there, since bumping rebuild_generation already is the confirmation.
 set -euo pipefail
 
 API=https://api.hetzner.cloud/v1
 IMAGE=${IMAGE:-ubuntu-24.04}
-cmd=${1:?usage: hcloud.sh ip|import|rebuild <server>}
+cmd=${1:?usage: hcloud.sh ip|import|rebuild|bootstrap <server>}
 name=${2:?server name}
 : "${HCLOUD_TOKEN:?export HCLOUD_TOKEN first}"
-# Run from the repo root, so tofu is pointed at hetzner/ explicitly.
-TOFU="tofu -chdir=$(dirname "$0")/.."
+# Callable from anywhere, so tofu is pointed at hetzner/infra explicitly.
+SCRIPTS=$(cd "$(dirname "$0")" && pwd)
+TOFU="tofu -chdir=$SCRIPTS/../infra"
 
 api() {
   curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" -H "Content-Type: application/json" "$@"
@@ -66,8 +69,10 @@ case $cmd in
   rebuild)
     ip=$(jq -r '.public_net.ipv4.ip' <<<"$server")
     echo "WARNING: this erases ALL data on '$name' ($ip) and reinstalls $IMAGE."
-    read -r -p "Type the server name to confirm: " answer
-    [ "$answer" = "$name" ] || { echo "Aborted."; exit 1; }
+    if [ "${3:-}" != "--yes" ]; then
+      read -r -p "Type the server name to confirm: " answer
+      [ "$answer" = "$name" ] || { echo "Aborted."; exit 1; }
+    fi
 
     resp=$(api -X POST "$API/servers/$id/actions/rebuild" -d "{\"image\": \"$IMAGE\"}")
     wait_action "$(jq -r '.action.id' <<<"$resp")"
@@ -86,7 +91,34 @@ case $cmd in
       echo "Port 22 still closed after 5 min: does a firewall attached to $name block it?" >&2
       exit 1
     }
-    echo "SSH is up. Next: make hetzner-bootstrap"
+    echo "SSH is up."
+    ;;
+
+  bootstrap)
+    : "${ADMIN_USER:?}" "${SSH_PORT:?}" "${ACME_EMAIL:?}" "${KUBECONFIG_OUT:?}" "${API_PORT:?}"
+    ip=$(jq -r '.public_net.ipv4.ip' <<<"$server")
+    env="ADMIN_USER=$ADMIN_USER SSH_PORT=$SSH_PORT ACME_EMAIL=$ACME_EMAIL"
+    ssh_opts=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5)
+    admin_ssh=(ssh "${ssh_opts[@]}" -p "$SSH_PORT" "$ADMIN_USER@$ip")
+    # A fresh image only lets root in on 22, a finished bootstrap only the admin user on SSH_PORT. A
+    # run that died after writing the sshd config leaves only the admin user on 22 (socket-activated
+    # sshd picks up the new config, but not the port).
+    login=()
+    for candidate in "$ADMIN_USER:$SSH_PORT" "$ADMIN_USER:22" "root:22"; do
+      try=(-p "${candidate#*:}" "${candidate%%:*}@$ip")
+      if ssh "${ssh_opts[@]}" "${try[@]}" true 2>/dev/null; then login=("${try[@]}"); break; fi
+    done
+    [ ${#login[@]} -gt 0 ] || { echo "No SSH login works on $ip (tried $ADMIN_USER on $SSH_PORT/22, root on 22)." >&2; exit 1; }
+    echo "Bootstrapping via ssh ${login[*]}"
+    # $env is meant to expand here: it's passed to the remote sudo.
+    # shellcheck disable=SC2029
+    ssh "${ssh_opts[@]}" "${login[@]}" "sudo $env bash -s" < "$SCRIPTS/bootstrap.sh"
+    # Points at the local end of `make hetzner-tunnel`; the API isn't reachable on the public IP.
+    "${admin_ssh[@]}" sudo cat /etc/rancher/k3s/k3s.yaml \
+      | sed "s#https://127.0.0.1:6443#https://127.0.0.1:$API_PORT#; s#: default\$#: hetzner#" \
+      > "$KUBECONFIG_OUT"
+    chmod 600 "$KUBECONFIG_OUT"
+    echo "Wrote $KUBECONFIG_OUT."
     ;;
 
   *)

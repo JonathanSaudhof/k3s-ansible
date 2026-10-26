@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars (gitignored) and adjust.
+# server_type and location must match the existing server: make hetzner-import prints both.
+name        = "vm-k3s"
+server_type = "cx23"
+location    = "nbg1"
+
+# Let's Encrypt account for Traefik (dashboard/management certificate).
+acme_email = "you@example.com"
+
+# Bump to WIPE the server and reinstall Ubuntu + k3s on the next `make hetzner-up`.
+rebuild_generation = 0
+
+# Defaults, shown for reference:
+# ssh_port          = 1337
+# dns_zone          = "ez-lab.de"
+# netbird_subdomain = "netbird"
+# enable_backups    = true   # +20% of the server price

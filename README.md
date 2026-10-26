@@ -130,55 +130,72 @@ no control-plane HA.
 
 ## Hetzner (public VM)
 
-`hetzner/` turns the existing Hetzner Cloud server **`vm-k3s`** into a single public k3s node running
-[Pangolin](https://github.com/fosrl/pangolin), the reverse proxy / tunnel server for public pet projects.
-OpenTofu imports the server and its primary IPs instead of creating new ones, and manages its firewall,
-DNS records and settings. The OS is wiped and reinstalled through the Hetzner API
-(`scripts/hcloud.sh rebuild`). `scripts/bootstrap.sh` then sets it up over SSH, because cloud-init
-only runs when a server is created.
+`hetzner/` turns the existing Hetzner Cloud server **`vm-k3s`** into a single public k3s node running a
+self-hosted [NetBird](https://netbird.io): management, signal, relay and STUN (combined `netbird-server`
+with the embedded IdP), the dashboard, and the NetBird **reverse proxy**. The reverse proxy publishes
+homelab apps from `../k3s-configuration` (Logto, AFFiNE, ...) to the internet: it reaches them over
+WireGuard through a NetBird routing peer in the Proxmox cluster, so nothing at home is exposed.
 
-- **Firewall** (Hetzner Cloud Firewall): only these ports are open, from anywhere:
-  - TCP 1337 (SSH, key only)
-  - TCP 80 and 443 (Traefik)
-  - UDP 51820 and 21820 (Gerbil WireGuard: Newt sites and clients)
+```
+internet -> auth.ez-lab.de (*.ez-lab.de) -> Traefik TLS passthrough -> netbird-proxy
+         -> WireGuard -> netbird-router (Proxmox k3s) -> 192.168.178.27:3001 (Logto)
+```
+
+Everything runs from OpenTofu, in three stages (each its own root module and local state), because the
+Kubernetes and NetBird providers need a cluster and a server that the stage before creates:
+
+| Stage | What | Providers |
+|---|---|---|
+| `hetzner/infra` | server (imported), primary IPs, firewall, DNS; **wipe + Ubuntu 24.04 reinstall** (`rebuild_generation`), then `scripts/bootstrap.sh` (k3s) and `kubeconfig-hetzner` | hcloud |
+| `hetzner/platform` | NetBird server, dashboard and reverse proxy on the VM's k3s, Traefik routes | kubernetes (through the API tunnel) |
+| `hetzner/netbird` | NetBird network `homelab`, routing peer group + setup key, one reverse proxy service per app, the setup key as a Secret in the Proxmox cluster | netbird, kubernetes (`~/.kube/config`, `homelab_kubeconfig`) |
+
+`hetzner/apps.json` lists the published apps (name -> LAN IP and port of their MetalLB service). The
+netbird stage turns each into a reverse proxy service `<name>.ez-lab.de`; no DNS record per app is needed.
+
+- **Firewall** (Hetzner Cloud Firewall), open from anywhere:
+  - TCP 1337 (SSH, key only); TCP 22 (only used between a rebuild and bootstrap; nothing listens after)
+  - TCP 80 and 443 (Traefik: dashboard, management/signal/relay, reverse proxy)
+  - UDP 3478 (NetBird STUN)
   - ICMP
-  Port 22 and the k3s API (6443) are closed; reach the API with `make hetzner-tunnel`.
-- **IPs and DNS**: the server's existing primary IPs are imported and set to `auto_delete = false`.
-  `pangolin.ez-lab.de`, plus one name per entry in `public_subdomains`, get A and AAAA records in the
-  existing `ez-lab.de` zone. Only those records are managed; the home records in the same zone are
-  untouched and there's no wildcard.
-- **Bootstrap** (`hetzner/scripts/bootstrap.sh`, runs as root):
+  The k3s API (6443) is closed; reach it with `make hetzner-tunnel`.
+- **DNS** in the existing `ez-lab.de` zone, A + AAAA to the VM: `netbird` (dashboard, management) and
+  the wildcard `*`, the reverse proxy's domain (`NB_PROXY_DOMAIN=ez-lab.de`). Every name without its own
+  record now lands on NetBird; names with an explicit record (apex, `coolify`, ...) are unaffected.
+- **Wipe/reinstall**: bump `rebuild_generation` in `hetzner/infra/terraform.tfvars` and apply. That's the
+  confirmation; there's no prompt. `0` never rebuilds.
+- **Bootstrap** (`hetzner/scripts/bootstrap.sh`, idempotent; re-runs after a rebuild or when it changes):
   - creates the `k3s` sudo user with root's SSH keys (Hetzner re-injects the keys from server creation on rebuild)
   - enables unattended-upgrades with reboots at 04:00
-  - installs k3s and configures its bundled Traefik with a `letsencrypt` resolver (HTTP-01, ACME state on a PVC)
+  - installs k3s; its bundled Traefik gets a `letsencrypt` resolver (HTTP-01), no websecure timeouts
+    (long-lived gRPC/WebSocket) and ACME bypass for the reverse proxy's TLS-ALPN challenges
   - moves sshd to port 1337, key only, with root login off
-- **Pangolin** (`hetzner/helm-values/pangolin-values.yaml`): uses the fossorial chart in controller mode,
-  where pangolin-kube-controller writes Traefik IngressRoutes. The database is CloudNativePG
-  (1 instance, `local-path`).
-  The chart is a **pre-release** (`0.1.0-alpha.1`, pinned in the Makefile): run `helm template` before bumping it.
+- **NetBird** (`hetzner/platform`): plain manifests, pinned images (`netbird_version`, `dashboard_version`),
+  sqlite on `local-path`. Traefik terminates TLS for `netbird.ez-lab.de` and passes every other SNI through
+  to the proxy (PROXY protocol v2), which gets its own certificates. The proxy's token is minted with the
+  server's admin CLI and goes straight into the `netbird-proxy-token` Secret, not into tofu state.
 
 Prerequisites:
-- `opentofu`, `helm`, `kubectl`, `curl` and `jq`.
+- `opentofu`, `kubectl`, `curl`, `jq` and `nc`.
 - The `ez-lab.de` zone in the Hetzner Console DNS, in the same project as `vm-k3s`.
 - An API token for that project with read/write access, in `.env` as `HCLOUD_TOKEN=...`
   (`cp .env.example .env`; gitignored, read by the Makefile and exported to tofu and the scripts).
+- A working kubeconfig for the Proxmox cluster in `~/.kube/config` (same as `../k3s-configuration`), or set `homelab_kubeconfig` in `hetzner/netbird/terraform.tfvars`.
 
 ```sh
 cp .env.example .env                # then set HCLOUD_TOKEN
-cp hetzner/terraform.tfvars.example hetzner/terraform.tfvars
+cp hetzner/infra/terraform.tfvars.example hetzner/infra/terraform.tfvars        # acme_email, ...
+cp hetzner/platform/terraform.tfvars.example hetzner/platform/terraform.tfvars  # owner_email
 make hetzner-init
 make hetzner-import               # prints vm-k3s' type and location; put both into terraform.tfvars
 make hetzner-plan                 # expect: firewall + DNS added, server/IPs updated in place, 0 destroyed
-make hetzner-rebuild              # WIPES vm-k3s, reinstalls Ubuntu 24.04 (asks for confirmation)
-make hetzner-bootstrap ACME_EMAIL=you@example.com   # over port 22, before apply closes it
-make hetzner-apply                # firewall (22 closed), IP settings, DNS records
-make hetzner-tunnel               # separate terminal; forwards the API to localhost:16443
-make hetzner-kubeconfig           # writes kubeconfig-hetzner
-KUBECONFIG=kubeconfig-hetzner kubectl get nodes
-make hetzner-install-cnpg
-make hetzner-install-pangolin
-make hetzner-pangolin-setup-token # then open https://pangolin.ez-lab.de/auth/initial-setup
-make hetzner-pangolin-ready       # starts Gerbil once the admin account exists
+# set rebuild_generation = 1 to wipe and reinstall (skip on a server that is already bootstrapped)
+make hetzner-up                   # infra + platform; netbird is skipped until NB_PAT is set
+                                  # (moves *.ez-lab.de to NetBird)
+make hetzner-netbird-secrets      # owner login; back the encryption key up to 1Password
+# https://netbird.ez-lab.de: Team -> Service Users -> new user (Admin) -> create token -> .env NB_PAT=...
+make hetzner-netbird              # network, router setup key, one reverse proxy service per app
+make -C ../k3s-configuration install-netbird-router
 make hetzner-shell                # ssh -p 1337 k3s@<ip>
 ```
 
@@ -186,23 +203,21 @@ Notes:
 - **Check the plan before applying.** If `hetzner-plan` wants to replace `hcloud_server.k3s`, fix
   `terraform.tfvars` first (usually `location`). `prevent_destroy` makes tofu refuse a replacement anyway.
   A different `server_type` resizes the server, which means a short downtime.
-- **Changing the SSH port or admin user:** change them in `variables.tf` *and* in
-  `HETZNER_SSH_PORT`/`HETZNER_ADMIN` in the Makefile. `hetzner-rebuild` and `hetzner-bootstrap` run before
-  the first apply, when there are no tofu outputs yet.
+- **Wildcard:** `*.ez-lab.de` used to point at 91.99.223.121. Anything still hosted there needs its own
+  record in the zone, or it now ends up at the NetBird proxy (which answers unknown names with an error).
 - **Hetzner returns a root password on rebuild** if `vm-k3s` was created without SSH keys. Then add your
-  key to `/root/.ssh/authorized_keys` through the Hetzner console before bootstrapping.
+  key to `/root/.ssh/authorized_keys` through the Hetzner console and apply again.
 - **Old cloud-init data:** the rebuild may re-run the server's original creation-time user_data on first
   boot. Bootstrap overrides the relevant settings.
-- `pangolin-app-secret` (`SERVER_SECRET`) is generated once and only exists in the cluster.
-  Copy it to 1Password:
-  `KUBECONFIG=kubeconfig-hetzner kubectl get secret pangolin-app-secret -n pangolin -o jsonpath='{.data.SERVER_SECRET}' | base64 -d`
-- To publish an app, add its subdomain to `public_subdomains`, run `make hetzner-apply`, and create the
-  resource in Pangolin. In-cluster services are reachable from a local site via `<svc>.<ns>.svc.cluster.local`.
-  Apps elsewhere connect through Newt (`fossorial/newt` chart, or the binary).
+- **Secrets in state:** `hetzner/platform/terraform.tfstate` holds the NetBird owner password and store
+  encryption key, `hetzner/netbird/terraform.tfstate` the setup key. All state is local and gitignored;
+  back it up (the encryption key is needed to read the NetBird database), or move it to a remote backend.
+- **Adding an app:** add it to `hetzner/apps.json` and run `make hetzner-up`. The app's own login stays in
+  charge; the proxy adds no authentication.
+- After a rebuild, NetBird starts with an empty database: create a new PAT and re-run the netbird stage
+  (its state then refers to deleted objects; `rm hetzner/netbird/terraform.tfstate` first).
 - There's no destroy target: the server is reused, and `prevent_destroy` protects it. To give it up,
   remove the lifecycle block deliberately.
-- State is local (`hetzner/terraform.tfstate`, gitignored) and holds no secrets. Back it up, or move it
-  to a remote backend.
 
 ## Layout
 
@@ -215,8 +230,10 @@ setup_nfs_client.yml              mount the NFS share on all k3s nodes (node-lev
 scripts/create-k3s-template.sh    build the cloud-init template (runs on a Proxmox node)
 inventories/proxmox/hosts.ini     generated by `make vms`
 kubeconfig-proxmox                generated by `make k3s`
-hetzner/                         OpenTofu, bootstrap script and Pangolin config for vm-k3s on Hetzner
-kubeconfig-hetzner                generated by `make hetzner-kubeconfig`
+hetzner/{infra,platform,netbird}  OpenTofu stages for vm-k3s on Hetzner (OS, k3s, NetBird)
+hetzner/apps.json                 homelab apps published through the NetBird reverse proxy
+hetzner/scripts/                  Hetzner API helper and bootstrap script
+kubeconfig-hetzner                written by the infra stage
 ```
 
 `hosts.ini` and `prepare_my_cluster.yml` are the parked Raspberry Pi cluster. Nothing

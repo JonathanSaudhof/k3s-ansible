@@ -1,0 +1,9 @@
+{
+  "_comment": "Homelab apps published through the NetBird reverse proxy as <name>.<dns_zone>. Read by infra/ (DNS) and netbird/ (proxy services). host/port: the app's MetalLB LoadBalancer in k3s-configuration.",
+  "apps": {
+    "auth":       { "host": "192.168.178.27", "port": 3001 },
+    "affine":     { "host": "192.168.178.23", "port": 3010 },
+    "affine-mcp": { "host": "192.168.178.23", "port": 3000 },
+    "immich":     { "host": "192.168.178.21", "port": 2283 }
+  }
+}

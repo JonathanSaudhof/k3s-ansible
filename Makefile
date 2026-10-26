@@ -74,103 +74,80 @@ clean: ## Remove the generated inventory and kubeconfig
 	rm -f $(KUBECONFIG_OUT) $(INVENTORY)
 
 # --- Hetzner (OpenTofu in hetzner/) ---------------------------------------------------------
-# Reuses the existing server vm-k3s. Needs curl, jq, hetzner/terraform.tfvars (see the .example) and
-# HCLOUD_TOKEN from .env (gitignored, see .env.example); a value there overrides the environment.
-# Order: init -> import -> plan -> rebuild -> bootstrap -> apply.
-# `-include`: .env is optional, the token can also come from the environment.
+# Reuses the existing server vm-k3s. Three tofu stages, applied in order by hetzner-up:
+#   infra    firewall, IPs, DNS; wipe + Ubuntu reinstall (rebuild_generation) and k3s bootstrap
+#   platform NetBird server, dashboard and reverse proxy on the VM's k3s (through the API tunnel)
+#   netbird  NetBird network, homelab apps as reverse proxy services, router setup key; needs NB_PAT
+# Needs curl, jq, kubectl, hetzner/{infra,platform}/terraform.tfvars (see the .examples) and
+# HCLOUD_TOKEN (+ NB_PAT for stage 3) from .env (gitignored, see .env.example); a value there
+# overrides the environment. First time: hetzner-init -> hetzner-import -> hetzner-up.
+# `-include`: .env is optional, the tokens can also come from the environment.
 -include .env
 HCLOUD_TOKEN ?=
-export HCLOUD_TOKEN
-TOFU               := tofu -chdir=hetzner
+NB_PAT       ?=
+export HCLOUD_TOKEN NB_PAT
+HETZNER_STAGES     := infra platform netbird
+TOFU                = tofu -chdir=hetzner/$(1)
 HCLOUD             := hetzner/scripts/hcloud.sh
 HETZNER_SERVER     ?= vm-k3s
-# Let's Encrypt account email for Traefik; only needed by hetzner-bootstrap.
-ACME_EMAIL         ?=
-# rebuild/bootstrap run before the first apply, when there are no tofu outputs yet; keep these in
-# sync with ssh_port/admin_user in hetzner/variables.tf.
-HETZNER_SSH_PORT   ?= 1337
-HETZNER_ADMIN      ?= k3s
 HETZNER_KUBECONFIG := kubeconfig-hetzner
-# Local port the k3s API is forwarded to; 6443 is closed on the public IP.
+# Local port the k3s API is forwarded to; 6443 is closed on the public IP. Keep in sync with
+# api_tunnel_port in hetzner/infra/variables.tf.
 HETZNER_API_PORT   ?= 16443
-PANGOLIN_VERSION   := 0.1.0-alpha.1
-CNPG_VERSION       ?= 0.28.0
-tf_out  = $$($(TOFU) output -raw $(1))
+TUNNEL_SOCKET      := /tmp/k3s-hetzner-tunnel.sock
+tf_out  = $$($(call TOFU,infra) output -raw $(1))
 SSH_HZ  = ssh -p $(call tf_out,ssh_port) $(call tf_out,admin_user)@$(call tf_out,public_ipv4)
 KUBE_HZ = KUBECONFIG=$(HETZNER_KUBECONFIG)
-# pangolin-kube-controller's NetworkPolicy has to allow the API server, which k3s serves on the
-# node's public IP; gerbil.startupMode is passed per target.
-PANGOLIN_HELM = $(KUBE_HZ) helm upgrade --install pangolin fossorial/pangolin \
-	--version $(PANGOLIN_VERSION) --namespace pangolin \
-	--values hetzner/helm-values/pangolin-values.yaml \
-	--set networkPolicy.controller.egress.kubernetesApi.cidr=$(call tf_out,public_ipv4)/32 \
-	--set networkPolicy.controller.egress.kubernetesApi.port=6443
 
-.PHONY: hetzner-init hetzner-import hetzner-plan hetzner-rebuild hetzner-bootstrap hetzner-apply hetzner-shell hetzner-kubeconfig hetzner-tunnel \
-	hetzner-install-cnpg hetzner-install-pangolin hetzner-pangolin-setup-token hetzner-pangolin-ready
+.PHONY: hetzner-init hetzner-import hetzner-plan hetzner-up hetzner-infra hetzner-platform hetzner-netbird \
+	hetzner-shell hetzner-tunnel hetzner-tunnel-up hetzner-tunnel-down hetzner-netbird-secrets
 
-hetzner-init: ## Hetzner: install the OpenTofu providers
-	$(TOFU) init
+hetzner-init: ## Hetzner: install the OpenTofu providers of all stages
+	@for s in $(HETZNER_STAGES); do $(call TOFU,$$s) init -upgrade || exit 1; done
 
 hetzner-import: ## Hetzner: import vm-k3s and its primary IPs into tofu state
 	$(HCLOUD) import $(HETZNER_SERVER)
 
-hetzner-plan: ## Hetzner: show what tofu would change
-	$(TOFU) plan
+hetzner-plan: ## Hetzner: show what the infra stage would change
+	$(call TOFU,infra) plan
 
-# WARNING: erases all data on the server (asks for the server name to confirm).
-hetzner-rebuild: ## Hetzner: wipe vm-k3s and reinstall Ubuntu 24.04
-	SSH_PORT=$(HETZNER_SSH_PORT) $(HCLOUD) rebuild $(HETZNER_SERVER)
+# The wipe only happens when rebuild_generation in hetzner/infra/terraform.tfvars was bumped.
+hetzner-up: hetzner-infra hetzner-platform hetzner-netbird ## Hetzner: apply all stages (infra, platform, netbird)
 
-# Runs as root on port 22, so do it before hetzner-apply closes 22. The script ends by moving sshd
-# to the custom port and turning root login off.
-hetzner-bootstrap: ## Hetzner: harden the rebuilt server and install k3s (ACME_EMAIL=...)
-	@test -n "$(ACME_EMAIL)" || { echo "ACME_EMAIL is required"; exit 1; }
-	ssh -o StrictHostKeyChecking=accept-new root@$$($(HCLOUD) ip $(HETZNER_SERVER)) \
-		ADMIN_USER=$(HETZNER_ADMIN) SSH_PORT=$(HETZNER_SSH_PORT) ACME_EMAIL=$(ACME_EMAIL) \
-		bash -s < hetzner/scripts/bootstrap.sh
+hetzner-infra: ## Hetzner: firewall, DNS, (re)install Ubuntu + k3s, kubeconfig
+	$(call TOFU,infra) apply
 
-hetzner-apply: ## Hetzner: apply firewall, IPs, DNS and server settings
-	$(TOFU) apply
+hetzner-platform: ## Hetzner: install NetBird on the VM's k3s
+	@$(MAKE) --no-print-directory hetzner-tunnel-up
+	$(call TOFU,platform) apply; rc=$$?; $(MAKE) --no-print-directory hetzner-tunnel-down; exit $$rc
+
+# Skipped until NB_PAT is set: the PAT can only be created in the dashboard once NetBird runs.
+hetzner-netbird: ## Hetzner: configure NetBird (network, public apps, router key); needs NB_PAT
+	@if [ -z "$(NB_PAT)" ]; then \
+		echo "NB_PAT not set: skipping the netbird stage. Log in to https://$(call tf_out,netbird_host)"; \
+		echo "(make hetzner-netbird-secrets), create a service user with admin role + access token,"; \
+		echo "put it in .env as NB_PAT=... and run make hetzner-netbird."; \
+	else \
+		$(call TOFU,netbird) apply; \
+	fi
 
 hetzner-shell: ## Hetzner: SSH into the VM (port 1337, key only)
 	$(SSH_HZ)
 
-hetzner-kubeconfig: ## Hetzner: fetch the kubeconfig (use with hetzner-tunnel)
-	$(SSH_HZ) sudo cat /etc/rancher/k3s/k3s.yaml \
-		| sed 's#https://127.0.0.1:6443#https://127.0.0.1:$(HETZNER_API_PORT)#; s#: default$$#: hetzner#' \
-		> $(HETZNER_KUBECONFIG)
-	chmod 600 $(HETZNER_KUBECONFIG)
-
 hetzner-tunnel: ## Hetzner: forward the k3s API to localhost:16443 (keep running)
 	$(SSH_HZ) -N -L $(HETZNER_API_PORT):127.0.0.1:6443
 
-hetzner-install-cnpg: ## Hetzner: install the CloudNativePG operator
-	helm repo add cnpg https://cloudnative-pg.github.io/charts # no-op when already added
-	helm repo update cnpg
-	$(KUBE_HZ) helm upgrade --install cnpg cnpg/cloudnative-pg \
-		--version $(CNPG_VERSION) --namespace cnpg-system --create-namespace \
-		--wait --timeout 5m
-	$(KUBE_HZ) kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=cloudnative-pg -n cnpg-system --timeout=300s
+# Background variant for the platform stage: a control socket so it can be closed again.
+hetzner-tunnel-up:
+	@$(SSH_HZ) -S $(TUNNEL_SOCKET) -O check 2>/dev/null || \
+		$(SSH_HZ) -f -N -M -S $(TUNNEL_SOCKET) -o ExitOnForwardFailure=yes -L $(HETZNER_API_PORT):127.0.0.1:6443
 
-# First install: Gerbil stays at 0 replicas until the admin account exists (hetzner-pangolin-ready).
-hetzner-install-pangolin: ## Hetzner: install Pangolin (needs hetzner-install-cnpg)
-	helm repo add fossorial https://charts.fossorial.io # no-op when already added
-	helm repo update fossorial
-	$(KUBE_HZ) kubectl apply -k hetzner/apps/pangolin
-	@# Created once so the secret never rotates on re-runs; back it up to 1Password.
-	@if ! $(KUBE_HZ) kubectl get secret pangolin-app-secret -n pangolin >/dev/null 2>&1; then \
-		$(KUBE_HZ) kubectl create secret generic pangolin-app-secret -n pangolin \
-			--from-literal=SERVER_SECRET="$$(openssl rand -hex 32)"; \
-	fi
-	$(PANGOLIN_HELM) --set gerbil.startupMode=delayed --wait --timeout 10m
-	$(KUBE_HZ) kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=pangolin -n pangolin --timeout=300s
-	@echo "Open https://$(call tf_out,pangolin_host)/auth/initial-setup, token: make hetzner-pangolin-setup-token"
+hetzner-tunnel-down:
+	@$(SSH_HZ) -S $(TUNNEL_SOCKET) -O exit 2>/dev/null || true
 
-hetzner-pangolin-setup-token: ## Hetzner: print Pangolin's first-run setup token
-	$(KUBE_HZ) kubectl logs -n pangolin deploy/pangolin -c pangolin \
-		| sed -n '/SETUP TOKEN GENERATED/,/================================/p'
-
-hetzner-pangolin-ready: ## Hetzner: start Gerbil after the Pangolin initial setup
-	$(PANGOLIN_HELM) --set gerbil.startupMode=normal --wait --timeout 10m
-	$(KUBE_HZ) kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=gerbil -n pangolin --timeout=300s
+# Back the store encryption key up to 1Password: without it the NetBird database is unreadable.
+hetzner-netbird-secrets: ## Hetzner: print the NetBird owner login and store encryption key
+	@echo "Dashboard:      $$($(call TOFU,platform) output -raw dashboard_url)"
+	@echo "Owner:          $$($(call TOFU,platform) output -raw owner_email)"
+	@echo "Password:       $$($(call TOFU,platform) output -raw owner_password)  (first start only)"
+	@echo "Encryption key: $$($(call TOFU,platform) output -raw store_encryption_key)"

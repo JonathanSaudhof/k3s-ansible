@@ -11,7 +11,7 @@ variable "server_type" {
 }
 
 variable "image" {
-  description = "Image make hetzner-rebuild installs; scripts/bootstrap.sh assumes Ubuntu 24.04"
+  description = "Image a rebuild installs; scripts/bootstrap.sh assumes Ubuntu 24.04"
   type        = string
   default     = "ubuntu-24.04"
 }
@@ -46,16 +46,27 @@ variable "dns_zone" {
   default     = "ez-lab.de"
 }
 
-variable "pangolin_subdomain" {
-  description = "Subdomain for the Pangolin dashboard and Gerbil endpoint"
+variable "netbird_subdomain" {
+  description = "Subdomain for the NetBird dashboard, management, signal and relay"
   type        = string
-  default     = "pangolin"
+  default     = "netbird"
 }
 
-variable "public_subdomains" {
-  description = "Extra subdomains pointed at the VM, one per Pangolin resource (e.g. [\"blog\"])"
-  type        = list(string)
-  default     = []
+variable "rebuild_generation" {
+  description = "Bump to WIPE the server and reinstall var.image on the next apply; 0 never rebuilds"
+  type        = number
+  default     = 0
+}
+
+variable "acme_email" {
+  description = "Let's Encrypt account email for Traefik (set in terraform.tfvars)"
+  type        = string
+}
+
+variable "api_tunnel_port" {
+  description = "Local port make hetzner-tunnel forwards the k3s API to; written into kubeconfig-hetzner"
+  type        = number
+  default     = 16443
 }
 
 variable "dns_ttl" {

@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars (gitignored) and adjust.
+# Admin account NetBird creates on first start; the password is generated (make hetzner-netbird-secrets).
+owner_email = "you@example.com"
+
+# Defaults, shown for reference:
+# netbird_version   = "0.81.4"   # netbird-server + reverse-proxy
+# dashboard_version = "v2.95.0"

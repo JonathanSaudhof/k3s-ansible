@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Turns a freshly rebuilt Ubuntu 24.04 server into the single-node k3s host for Pangolin.
-# Runs ON the server as root, piped over SSH by `make hetzner-bootstrap`:
+# Turns a freshly rebuilt Ubuntu 24.04 server into the single-node k3s host for NetBird.
+# Runs ON the server as root, piped over SSH by `hcloud.sh bootstrap` (terraform_data.bootstrap):
 #   ssh root@<ip> ADMIN_USER=k3s SSH_PORT=1337 ACME_EMAIL=... bash -s < bootstrap.sh
 # Safe to re-run. The SSH port switch happens last, so this session isn't cut off half-way.
 set -euo pipefail
@@ -48,9 +48,10 @@ secrets-encryption: true
 write-kubeconfig-mode: "0600"
 EOF
 
-# k3s applies everything in this directory. Configures the bundled Traefik, which the Pangolin
-# chart (controller mode) uses as its ingress: a "letsencrypt" resolver with ACME state on a PVC,
-# and cross-namespace CRD references for the IngressRoutes pangolin-kube-controller writes.
+# k3s applies everything in this directory. Configures the bundled Traefik, NetBird's ingress
+# (hetzner/platform): a "letsencrypt" resolver with ACME state on a PVC for netbird.<zone>; no
+# timeouts on websecure, which carries NetBird's long-lived gRPC and relay WebSocket streams; and
+# ACME bypass, so the reverse proxy's own tls-alpn-01 challenges reach it through TLS passthrough.
 cat > /var/lib/rancher/k3s/server/manifests/traefik-config.yaml <<EOF
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
@@ -70,9 +71,15 @@ spec:
           storage: /data/acme.json
           httpChallenge:
             entryPoint: web
-    providers:
-      kubernetesCRD:
-        allowCrossNamespace: true
+    ports:
+      websecure:
+        transport:
+          respondingTimeouts:
+            readTimeout: 0
+            writeTimeout: 0
+            idleTimeout: 0
+    additionalArguments:
+      - --entryPoints.websecure.allowACMEByPass=true
 EOF
 
 if ! systemctl is-active --quiet k3s; then
@@ -93,6 +100,9 @@ KbdInteractiveAuthentication no
 AuthenticationMethods publickey
 AllowUsers ${ADMIN_USER}
 EOF
+# Socket activation only creates sshd's privilege separation directory when a connection spawns
+# sshd, and `sshd -t` refuses to run without it.
+install -d -m 755 /run/sshd
 sshd -t
 # Ubuntu 24.04 socket-activates sshd, which ignores Port in sshd_config without a generator
 # re-run; running sshd as a plain service makes the port setting authoritative. Existing sessions
