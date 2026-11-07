@@ -77,6 +77,8 @@ resource "kubernetes_deployment_v1" "proxy" {
               # Traefik prepends PROXY protocol v2 (ServersTransportTCP pp-v2) to keep client IPs.
               NB_PROXY_PROXY_PROTOCOL  = "true"
               NB_PROXY_TRUSTED_PROXIES = var.pod_cidr
+              # Reports the Private capability, which NetBird-only access needs (hidden flag, off by default).
+              NB_PROXY_PRIVATE = "true"
             }
             content {
               name  = env.key
