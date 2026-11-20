@@ -64,7 +64,7 @@ resource "netbird_reverse_proxy_service" "app" {
     protocol    = "http"
   }]
 
-  # The apps keep their own login (Logto OIDC); the proxy doesn't add one.
+  # The apps keep their own login (Authelia OIDC); the proxy doesn't add one.
   auth             = {}
   pass_host_header = true
 }

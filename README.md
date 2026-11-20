@@ -133,12 +133,12 @@ no control-plane HA.
 `hetzner/` turns the existing Hetzner Cloud server **`vm-k3s`** into a single public k3s node running a
 self-hosted [NetBird](https://netbird.io): management, signal, relay and STUN (combined `netbird-server`
 with the embedded IdP), the dashboard, and the NetBird **reverse proxy**. The reverse proxy publishes
-homelab apps from `../k3s-configuration` (Logto, AFFiNE, ...) to the internet: it reaches them over
+homelab apps from `../k3s-configuration` (Authelia, AFFiNE, ...) to the internet: it reaches them over
 WireGuard through a NetBird routing peer in the Proxmox cluster, so nothing at home is exposed.
 
 ```
 internet -> auth.ez-lab.de (*.ez-lab.de) -> Traefik TLS passthrough -> netbird-proxy
-         -> WireGuard -> netbird-router (Proxmox k3s) -> 192.168.178.27:3001 (Logto)
+         -> WireGuard -> netbird-router (Proxmox k3s) -> 192.168.178.27:3001 (Authelia)
 ```
 
 Everything runs from OpenTofu, in three stages (each its own root module and local state), because the
