@@ -100,7 +100,7 @@ SSH_HZ  = ssh -p $(call tf_out,ssh_port) $(call tf_out,admin_user)@$(call tf_out
 KUBE_HZ = KUBECONFIG=$(HETZNER_KUBECONFIG)
 
 .PHONY: hetzner-init hetzner-import hetzner-plan hetzner-up hetzner-infra hetzner-platform hetzner-netbird \
-	hetzner-shell hetzner-tunnel hetzner-tunnel-up hetzner-tunnel-down hetzner-netbird-secrets
+	hetzner-shell hetzner-tunnel hetzner-tunnel-up hetzner-tunnel-down hetzner-netbird-secrets hetzner-netbird-check
 
 hetzner-init: ## Hetzner: install the OpenTofu providers of all stages
 	@for s in $(HETZNER_STAGES); do $(call TOFU,$$s) init -upgrade || exit 1; done
@@ -130,6 +130,10 @@ hetzner-netbird: ## Hetzner: configure NetBird (network, public apps, router key
 	else \
 		$(call TOFU,netbird) apply; \
 	fi
+
+# tofu plan alone misses objects made in the dashboard; this also lists those.
+hetzner-netbird-check: ## Hetzner: list NetBird objects not in tofu + drift on managed ones; needs NB_PAT
+	hetzner/scripts/netbird-drift.sh
 
 hetzner-shell: ## Hetzner: SSH into the VM (port 1337, key only)
 	$(SSH_HZ)
