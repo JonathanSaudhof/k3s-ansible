@@ -52,6 +52,7 @@ EOF
 # (hetzner/platform): a "letsencrypt" resolver with ACME state on a PVC for netbird.<zone>; no
 # timeouts on websecure, which carries NetBird's long-lived gRPC and relay WebSocket streams; and
 # ACME bypass, so the reverse proxy's own tls-alpn-01 challenges reach it through TLS passthrough.
+# externalTrafficPolicy Local: ServiceLB doesn't SNAT, so NetBird sees real client IPs (single node).
 cat > /var/lib/rancher/k3s/server/manifests/traefik-config.yaml <<EOF
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
@@ -64,6 +65,9 @@ spec:
       enabled: true
       storageClass: local-path
       size: 128Mi
+    service:
+      spec:
+        externalTrafficPolicy: Local
     certificatesResolvers:
       letsencrypt:
         acme:
